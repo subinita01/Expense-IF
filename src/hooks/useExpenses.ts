@@ -1,60 +1,137 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Expense, Category } from '@/types/expense';
+import { useEffect, useState, useCallback, useMemo } from "react";
+import {
+  collection,
+  addDoc,
+  deleteDoc,
+  doc,
+  updateDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  Timestamp,
+} from "firebase/firestore";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth, db } from "@/firebase";
+import { Expense, Category } from "@/types/expense";
 
-const STORAGE_KEY = 'expense-tracker-data';
-
-const generateId = () => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+/**
+ * Firestore structure:
+ * users/{uid}/expenses/{expenseId}
+ */
 
 export const useExpenses = () => {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // Load from localStorage on mount
+  // 🔥 AUTH + REAL-TIME LISTENER
   useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      try {
-        setExpenses(JSON.parse(stored));
-      } catch (e) {
-        console.error('Failed to parse expenses from localStorage');
+    let unsubscribeExpenses: (() => void) | undefined;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, user => {
+      if (!user) {
+        setExpenses([]);
+        setIsLoaded(true);
+        if (unsubscribeExpenses) unsubscribeExpenses();
+        return;
       }
-    }
-    setIsLoaded(true);
-  }, []);
 
-  // Save to localStorage whenever expenses change
-  useEffect(() => {
-    if (isLoaded) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(expenses));
-    }
-  }, [expenses, isLoaded]);
+      const q = query(
+        collection(db, "users", user.uid, "expenses"),
+        orderBy("createdAt", "desc")
+      );
 
-  const addExpense = useCallback((expense: Omit<Expense, 'id'>) => {
-    const newExpense: Expense = {
-      ...expense,
-      id: generateId(),
+      unsubscribeExpenses = onSnapshot(q, snapshot => {
+        const data: Expense[] = snapshot.docs.map(docSnap => {
+          const d = docSnap.data();
+          return {
+            id: docSnap.id,
+            title: d.title,
+            amount: d.amount,
+            category: d.category,
+            date: d.date,
+            description: d.description,
+          };
+        });
+
+        setExpenses(data);
+        setIsLoaded(true);
+      });
+    });
+
+    return () => {
+      unsubscribeAuth();
+      if (unsubscribeExpenses) unsubscribeExpenses();
     };
-    setExpenses(prev => [newExpense, ...prev]);
-    return newExpense;
   }, []);
 
-  const updateExpense = useCallback((id: string, updates: Partial<Omit<Expense, 'id'>>) => {
-    setExpenses(prev => 
-      prev.map(expense => 
-        expense.id === id ? { ...expense, ...updates } : expense
-      )
-    );
-  }, []);
+  // ➕ ADD
+  const addExpense = useCallback(
+    async (expense: Omit<Expense, "id">) => {
+      const user = auth.currentUser;
+      if (!user) throw new Error("Not authenticated");
 
-  const deleteExpense = useCallback((id: string) => {
-    setExpenses(prev => prev.filter(expense => expense.id !== id));
-  }, []);
+      await addDoc(collection(db, "users", user.uid, "expenses"), {
+        ...expense,
+        createdAt: Timestamp.now(),
+      });
+    },
+    []
+  );
 
-  const getExpensesByCategory = useCallback((category: Category) => {
-    return expenses.filter(expense => expense.category === category);
+  // ✏️ UPDATE
+  const updateExpense = useCallback(
+    async (id: string, updates: Partial<Omit<Expense, "id">>) => {
+      const user = auth.currentUser;
+      if (!user) throw new Error("Not authenticated");
+
+      await updateDoc(
+        doc(db, "users", user.uid, "expenses", id),
+        updates
+      );
+    },
+    []
+  );
+
+  // 🗑 DELETE
+  const deleteExpense = useCallback(
+    async (id: string) => {
+      const user = auth.currentUser;
+      if (!user) throw new Error("Not authenticated");
+
+      await deleteDoc(doc(db, "users", user.uid, "expenses", id));
+    },
+    []
+  );
+
+  /* ======================
+     REAL-TIME DERIVED DATA
+     ====================== */
+
+  // 🔢 TOTAL RECORDS
+  const totalRecords = expenses.length;
+
+  // 💰 TOTAL EXPENSE
+  const totalExpense = useMemo(
+    () => expenses.reduce((sum, exp) => sum + exp.amount, 0),
+    [expenses]
+  );
+
+  // 📅 THIS MONTH TOTAL
+  const thisMonthTotal = useMemo(() => {
+    const now = new Date();
+    return expenses
+      .filter(exp => {
+        const d = new Date(exp.date);
+        return (
+          d.getMonth() === now.getMonth() &&
+          d.getFullYear() === now.getFullYear()
+        );
+      })
+      .reduce((sum, exp) => sum + exp.amount, 0);
   }, [expenses]);
 
-  const getTotalByCategory = useCallback(() => {
+  // 📊 TOTAL BY CATEGORY
+  const totalByCategory = useMemo(() => {
     const totals: Record<Category, number> = {
       food: 0,
       transport: 0,
@@ -65,51 +142,26 @@ export const useExpenses = () => {
       other: 0,
     };
 
-    expenses.forEach(expense => {
-      totals[expense.category] += expense.amount;
+    expenses.forEach(exp => {
+      totals[exp.category] += exp.amount;
     });
 
     return totals;
   }, [expenses]);
 
-  const getTotal = useCallback(() => {
-    return expenses.reduce((sum, expense) => sum + expense.amount, 0);
-  }, [expenses]);
-
-  const getThisMonthTotal = useCallback(() => {
-    const now = new Date();
-    const thisMonth = now.getMonth();
-    const thisYear = now.getFullYear();
-
-    return expenses
-      .filter(expense => {
-        const date = new Date(expense.date);
-        return date.getMonth() === thisMonth && date.getFullYear() === thisYear;
-      })
-      .reduce((sum, expense) => sum + expense.amount, 0);
-  }, [expenses]);
-
-  const getThisMonthExpenses = useCallback(() => {
-    const now = new Date();
-    const thisMonth = now.getMonth();
-    const thisYear = now.getFullYear();
-
-    return expenses.filter(expense => {
-      const date = new Date(expense.date);
-      return date.getMonth() === thisMonth && date.getFullYear() === thisYear;
-    });
-  }, [expenses]);
-
   return {
     expenses,
     isLoaded,
+
+    // actions
     addExpense,
     updateExpense,
     deleteExpense,
-    getExpensesByCategory,
-    getTotalByCategory,
-    getTotal,
-    getThisMonthTotal,
-    getThisMonthExpenses,
+
+    // 🔥 real-time values
+    totalExpense,
+    thisMonthTotal,
+    totalRecords,
+    totalByCategory,
   };
 };
